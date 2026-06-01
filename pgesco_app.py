@@ -15,6 +15,133 @@ import matplotlib
 matplotlib.use('Agg')
 
 # ══════════════════════════════════════════════════════════════════
+#  GOOGLE DRIVE INTEGRATION
+# ══════════════════════════════════════════════════════════════════
+FOLDER_ID = "1OJHstR9mjF2VNbzQYbtIjnGUKLQgVvjP"
+
+@st.cache_resource
+def get_drive_service():
+    """Build Google Drive service from Streamlit secrets."""
+    try:
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build
+        creds = service_account.Credentials.from_service_account_info(
+            st.secrets["gcp_service_account"],
+            scopes=["https://www.googleapis.com/auth/drive"]
+        )
+        return build("drive", "v3", credentials=creds)
+    except Exception as e:
+        return None
+
+def list_drive_files(service, folder_id, mime_filter=None):
+    """List files in a Google Drive folder."""
+    try:
+        q = f"'{folder_id}' in parents and trashed=false"
+        if mime_filter:
+            q += f" and mimeType='{mime_filter}'"
+        results = service.files().list(
+            q=q, fields="files(id,name,size,modifiedTime)",
+            orderBy="name"
+        ).execute()
+        return results.get("files", [])
+    except Exception as e:
+        st.error(f"Drive error: {e}")
+        return []
+
+def list_drive_subfolders(service, folder_id):
+    """List subfolders in a Drive folder."""
+    try:
+        q = f"'{folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+        results = service.files().list(q=q, fields="files(id,name)").execute()
+        return results.get("files", [])
+    except Exception:
+        return []
+
+def download_drive_file(service, file_id):
+    """Download a file from Google Drive as bytes."""
+    try:
+        from googleapiclient.http import MediaIoBaseDownload
+        buf = io.BytesIO()
+        request = service.files().get_media(fileId=file_id)
+        downloader = MediaIoBaseDownload(buf, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        buf.seek(0)
+        return buf
+    except Exception as e:
+        st.error(f"Download error: {e}")
+        return None
+
+def upload_to_drive(service, folder_id, filename, data_bytes, mime_type):
+    """Upload a file to Google Drive folder."""
+    try:
+        from googleapiclient.http import MediaIoBaseUpload
+        from googleapiclient.discovery import build
+        meta = {"name": filename, "parents": [folder_id]}
+        media = MediaIoBaseUpload(io.BytesIO(data_bytes), mimetype=mime_type)
+        f = service.files().create(body=meta, media_body=media, fields="id,name").execute()
+        return f
+    except Exception as e:
+        st.error(f"Upload error: {e}")
+        return None
+
+def show_drive_browser(service, folder_id, title="📁 Google Drive Files",
+                       file_type=None, multi=False, key="drive"):
+    """
+    Show a file browser for Google Drive.
+    Returns selected file(s) as list of (name, bytes) tuples.
+    """
+    st.markdown(f"**{title}**")
+
+    # List subfolders
+    subfolders = list_drive_subfolders(service, folder_id)
+    folder_options = {"📁 Root (PGESCo_Files)": folder_id}
+    for sf in subfolders:
+        folder_options[f"📁 {sf['name']}"] = sf["id"]
+
+    sel_folder_name = st.selectbox("Folder", list(folder_options.keys()), key=f"{key}_folder")
+    active_folder = folder_options[sel_folder_name]
+
+    # List files
+    files = list_drive_files(service, active_folder)
+    if file_type:
+        exts = [file_type] if isinstance(file_type, str) else file_type
+        files = [f for f in files if any(f["name"].lower().endswith(e.lower()) for e in exts)]
+
+    if not files:
+        st.info("No files found in this folder")
+        return []
+
+    file_names = [f["name"] for f in files]
+
+    if multi:
+        selected = st.multiselect("Select files", file_names, key=f"{key}_sel")
+    else:
+        selected = [st.selectbox("Select file", file_names, key=f"{key}_sel")]
+
+    if not selected or (len(selected)==1 and not selected[0]):
+        return []
+
+    result = []
+    sel_files = [f for f in files if f["name"] in selected]
+
+    if st.button(f"📥 Load selected ({len(sel_files)} file(s))", key=f"{key}_load"):
+        prog = st.progress(0)
+        for i, f in enumerate(sel_files):
+            with st.spinner(f"Downloading {f['name']}…"):
+                buf = download_drive_file(service, f["id"])
+                if buf:
+                    buf.name = f["name"]  # add name attr for compatibility
+                    result.append(buf)
+            prog.progress((i+1)/len(sel_files))
+        prog.empty()
+        st.success(f"✓ Loaded {len(result)} file(s)")
+
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════
 #  PAGE CONFIG
 # ══════════════════════════════════════════════════════════════════
 st.set_page_config(
@@ -668,10 +795,12 @@ def page_insulation():
     with left:
         # Spec files
         st.markdown("<div class='section-hdr'>① Spec Files (C18, C38…)</div>", unsafe_allow_html=True)
-        spec_files = st.file_uploader("Upload spec Excel files",
-                                       type=["xlsx","xls"],
-                                       accept_multiple_files=True,
-                                       label_visibility="collapsed")
+        drive = get_drive_service()
+        if drive is None:
+            st.warning("Google Drive not connected")
+            spec_files = st.file_uploader("Or upload directly", type=["xlsx","xls"], accept_multiple_files=True, label_visibility="collapsed")
+        else:
+            spec_files = show_drive_browser(drive, FOLDER_ID, "📁 Select Spec Files", file_type=[".xlsx",".xls"], multi=True, key="spec")
         if spec_files:
             if st.button("⚡ Load Specs", use_container_width=True):
                 db = SpecDatabase()
@@ -691,9 +820,12 @@ def page_insulation():
 
         # MTO file
         st.markdown("<div class='section-hdr'>③ Raw Piping MTO</div>", unsafe_allow_html=True)
-        mto_file = st.file_uploader("Upload MTO Excel file",
-                                     type=["xlsx","xls"],
-                                     label_visibility="collapsed")
+        if drive is None:
+            mto_files = st.file_uploader("Or upload directly", type=["xlsx","xls"], label_visibility="collapsed")
+            mto_file = mto_files
+        else:
+            mto_loaded = show_drive_browser(drive, FOLDER_ID, "📁 Select MTO File", file_type=[".xlsx",".xls"], multi=False, key="mto")
+            mto_file = mto_loaded[0] if mto_loaded else None
         if mto_file:
             st.success(f"✓ {mto_file.name}")
 
@@ -771,13 +903,21 @@ def page_insulation():
 
             # Export
             excel_bytes = export_to_excel(result_rows)
+            fname_out = f"Insulation_MTO_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
             st.download_button(
-                label="⬇  Export Premium Insulation MTO (Excel)",
+                label="⬇  Download Insulation MTO (Excel)",
                 data=excel_bytes,
-                file_name=f"Insulation_MTO_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                file_name=fname_out,
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True
             )
+            drive_up = get_drive_service()
+            if drive_up and st.button("☁  Save to Google Drive", key="save_drive", use_container_width=True):
+                with st.spinner("Uploading to Drive…"):
+                    res = upload_to_drive(drive_up, FOLDER_ID, fname_out, excel_bytes,
+                                          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                    if res:
+                        st.success(f"✓ Saved to Drive: {res['name']}")
         else:
             st.info("Upload spec files, set insulation type, upload MTO file, then click PROCESS MTO")
 
@@ -797,9 +937,18 @@ def page_renamer():
 
     with left:
         st.markdown("<div class='section-hdr'>① Source Files</div>", unsafe_allow_html=True)
-        excel_file = st.file_uploader("Excel Sheet (Line Numbers)", type=["xlsx","xls"])
-        dwg_files  = st.file_uploader("DWG Files", type=["dwg"], accept_multiple_files=True)
-        pdf_files  = st.file_uploader("PDF Files", type=["pdf"], accept_multiple_files=True)
+        drive_r = get_drive_service()
+        if drive_r is None:
+            excel_file = st.file_uploader("Excel Sheet (Line Numbers)", type=["xlsx","xls"])
+            dwg_files  = st.file_uploader("DWG Files", type=["dwg"], accept_multiple_files=True)
+            pdf_files  = st.file_uploader("PDF Files", type=["pdf"], accept_multiple_files=True)
+        else:
+            ex_loaded = show_drive_browser(drive_r, FOLDER_ID, "📁 Select Excel Sheet", file_type=[".xlsx",".xls"], multi=False, key="ren_ex")
+            excel_file = ex_loaded[0] if ex_loaded else None
+            dwg_loaded = show_drive_browser(drive_r, FOLDER_ID, "📁 Select DWG Files", file_type=[".dwg"], multi=True, key="ren_dwg")
+            dwg_files  = dwg_loaded if dwg_loaded else []
+            pdf_loaded = show_drive_browser(drive_r, FOLDER_ID, "📁 Select PDF Files", file_type=[".pdf"], multi=True, key="ren_pdf")
+            pdf_files  = pdf_loaded if pdf_loaded else []
 
         st.markdown("---")
         st.markdown("<div class='section-hdr'>② DWG Settings</div>", unsafe_allow_html=True)
@@ -820,23 +969,62 @@ def page_renamer():
         mapping = {}
         if excel_file:
             try:
-                engine = "xlrd" if excel_file.name.lower().endswith(".xls") else "openpyxl"
-                df_ex = pd.read_excel(excel_file, engine=engine, header=None)
-                hr = None
-                for i in range(min(20,len(df_ex))):
-                    vals=[str(v).strip().lower() for v in df_ex.iloc[i] if str(v)!="nan"]
-                    if "line number" in vals or "line no" in vals: hr=i; break
-                if hr is not None:
-                    df2 = pd.read_excel(excel_file, engine=engine, header=hr)
-                    df2.columns=[str(c).strip().lower() for c in df2.columns]
-                    ln_col = next((c for c in df2.columns if "line number" in c or c in("line no","line no.")),None)
-                    dw_col = next((c for c in df2.columns if "dwg" in c),None)
-                    if ln_col and dw_col:
-                        for _,row in df2.iterrows():
-                            ln=str(row[ln_col]).strip(); dw=str(row[dw_col]).strip()
-                            if ln not in("nan","") and dw not in("nan",""):
-                                mapping[ln]=dw
-                        st.success(f"✓ Excel loaded: {len(mapping)} mappings")
+                # Try multiple engines
+                df_ex = None
+                fname = excel_file.name.lower()
+                for engine in (["xlrd"] if fname.endswith(".xls") else ["openpyxl","xlrd"]):
+                    try:
+                        excel_file.seek(0)
+                        df_ex = pd.read_excel(excel_file, engine=engine, header=None)
+                        break
+                    except Exception:
+                        continue
+
+                if df_ex is None:
+                    st.error("Cannot read Excel file — try saving as .xlsx format")
+                else:
+                    # Find header row — search broadly
+                    hr = None
+                    for i in range(min(30, len(df_ex))):
+                        vals = [str(v).strip().lower() for v in df_ex.iloc[i] if str(v) not in("nan","None","")]
+                        combined = " ".join(vals)
+                        if any(x in combined for x in ["line number","line no","lineno"]):
+                            hr = i; break
+                        # fallback: look for row with many non-empty cells (likely header)
+                    if hr is None:
+                        # Try first row with more than 3 non-empty values
+                        for i in range(min(10, len(df_ex))):
+                            vals = [v for v in df_ex.iloc[i] if str(v) not in("nan","None","")]
+                            if len(vals) >= 3:
+                                hr = i; break
+
+                    if hr is not None:
+                        excel_file.seek(0)
+                        df2 = pd.read_excel(excel_file, engine=engine, header=hr)
+                        df2.columns = [str(c).strip().lower() for c in df2.columns]
+
+                        # Show columns found for debugging
+                        with st.expander("📋 Columns found in Excel"):
+                            st.write(list(df2.columns))
+
+                        # Find line number column
+                        ln_col = next((c for c in df2.columns
+                                       if any(x in c for x in ["line number","line no","lineno","tag","line_no"])), None)
+                        # Find DWG name column
+                        dw_col = next((c for c in df2.columns
+                                       if any(x in c for x in ["dwg","drawing","doc"])), None)
+
+                        if ln_col and dw_col:
+                            for _, row in df2.iterrows():
+                                ln = str(row[ln_col]).strip()
+                                dw = str(row[dw_col]).strip()
+                                if ln not in ("nan","None","") and dw not in ("nan","None",""):
+                                    mapping[ln] = dw
+                            st.success(f"✓ Excel loaded: {len(mapping)} line number → DWG mappings")
+                        else:
+                            st.warning(f"Could not find 'Line Number' or 'DWG' columns.\nFound: {list(df2.columns)}\nRename your columns to contain 'Line Number' and 'DWG'.")
+                    else:
+                        st.warning("Could not find header row in Excel file")
             except Exception as e:
                 st.error(f"Excel error: {e}")
 
